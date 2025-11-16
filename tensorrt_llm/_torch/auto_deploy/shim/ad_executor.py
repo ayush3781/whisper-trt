@@ -121,8 +121,8 @@ class ADEngine(ModelEngine):
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
+            chunk_size=factory.chunk_size,
         )
-
         # TODO (lucaslie): consider how we move args around InferenceOptimizer.__init__,
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
@@ -143,18 +143,16 @@ class ADEngine(ModelEngine):
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
         # This is not correctly declared in the base ModelEngine class though...
-        self.pytorch_backend_config = SimpleNamespace()
-        self.pytorch_backend_config.print_iter_log = False
-        self.pytorch_backend_config.enable_iter_perf_stats = False
-        self.pytorch_backend_config.enable_iter_req_stats = False
-        self.pytorch_backend_config.stream_interval = 1
-        self.pytorch_backend_config.attention_dp_enable_balance = False
-        self.pytorch_backend_config.attention_dp_time_out_iters = 50
-        self.pytorch_backend_config.attention_dp_batching_wait_iters = 10
-        self.pytorch_backend_config.batch_wait_timeout_ms = 0
-        self.pytorch_backend_config.batch_wait_timeout_iters = 0
-        self.pytorch_backend_config.batch_wait_max_tokens_ratio = 0.0
-        self.pytorch_backend_config.max_num_tokens = seq_info.max_num_tokens
+        self.llm_args = SimpleNamespace()
+        self.llm_args.print_iter_log = False
+        self.llm_args.enable_iter_perf_stats = False
+        self.llm_args.enable_iter_req_stats = False
+        self.llm_args.stream_interval = 1
+        self.llm_args.attention_dp_config = None
+        self.llm_args.batch_wait_timeout_ms = 0
+        self.llm_args.batch_wait_timeout_iters = 0
+        self.llm_args.batch_wait_max_tokens_ratio = 0.0
+        self.llm_args.max_num_tokens = seq_info.max_num_tokens
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
@@ -169,7 +167,6 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
-
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -326,10 +323,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     torch.cuda.set_device(rank)
     port = mpi_dist.broadcast(dist.get_free_port())  # use MPI broadcast to pick a free port
     dist.initialize_or_skip(rank, world_size, port)
-
     # some config
-    msg = "pytorch_backend_config must be an AD LlmArgs object"
-    assert isinstance(ad_config, LlmArgs), msg
     assert ad_config.max_beam_width <= 1, "_autodeploy + beam_search is not supported"
 
     max_num_sequences = ad_config.max_batch_size * dist_mapping.pp_size
