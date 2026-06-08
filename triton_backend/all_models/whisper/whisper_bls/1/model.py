@@ -33,7 +33,7 @@ class TritonPythonModel:
         self.zero_pad = True if parameters["zero_pad"] == "true" else False
         self.feature_extractor = FeatureExtractor(n_mels=n_mels)
 
-    def _prepare_inputs(self, request, mel_feature, mel_len, prompt, max_tokens=50):
+    def _prepare_inputs(self, request, mel_feature, mel_len, prompt, max_tokens=256):
         input_dict = {
             "request_output_len": np.array([[max_tokens]], dtype=np.int32),
             "end_id": np.array([[self.eos]], dtype=np.int32),
@@ -49,6 +49,69 @@ class TritonPythonModel:
             pb_utils.Tensor.from_dlpack("encoder_input_features", to_dlpack(mel_feature.contiguous()))
         )
         return input_tensor_list
+
+    def _detect_language(self, request, mel_feature, mel_len):
+        """Use Whisper's own decoder to predict the language token.
+
+        This mirrors Whisper auto-detect at the BLS level:
+        1. Start decoding with only <|startoftranscript|>.
+        2. Ask the decoder for one token.
+        3. Treat that generated special token as the detected language.
+        """
+        sot_id = self.tokenizer.encode(
+            "<|startoftranscript|>",
+            allowed_special=self.tokenizer.special_tokens_set,
+        )[0]
+
+        detect_prompt = np.array([[sot_id]], dtype=np.int32)
+        detect_inputs = self._prepare_inputs(
+            request,
+            mel_feature,
+            mel_len,
+            detect_prompt,
+            max_tokens=1,
+        )
+
+        detect_request = pb_utils.InferenceRequest(
+            model_name="tensorrt_llm",
+            requested_output_names=["output_ids", "sequence_length", "output_log_probs"],
+            inputs=detect_inputs,
+        )
+        detect_response = detect_request.exec(decoupled=False)
+
+        if detect_response.has_error():
+            raise pb_utils.TritonModelException(detect_response.error().message())
+
+        output_token_ids_full = pb_utils.get_output_tensor_by_name(
+            detect_response, "output_ids"
+        ).as_numpy().flatten().tolist()
+
+        output_log_probs = pb_utils.get_output_tensor_by_name(
+            detect_response, "output_log_probs"
+        ).as_numpy().flatten().tolist()
+
+        # The TRT-LLM output can include the prompt depending on config.
+        # output_log_probs corresponds only to generated tokens, so use it
+        # to slice out the generated part.
+        num_generated = len(output_log_probs)
+        generated_token_ids = (
+            output_token_ids_full[-num_generated:]
+            if num_generated > 0
+            else output_token_ids_full[-1:]
+        )
+
+        if not generated_token_ids:
+            return "en"
+
+        detected_token = self.tokenizer.decode([generated_token_ids[0]]).strip()
+
+        # Expected output: <|en|>, <|es|>, <|ar|>, etc.
+        match = re.fullmatch(r"<\|([a-z]{2,3})\|>", detected_token)
+        if match:
+            return match.group(1)
+
+        # Safe fallback if the decoder emits a non-language token.
+        return "en"
 
     def _prepare_llm_response(self, llm_request_inputs):
         llm_request = pb_utils.InferenceRequest(
@@ -156,11 +219,6 @@ class TritonPythonModel:
         for request in requests:
             decoder_text_prompt = pb_utils.get_input_tensor_by_name(request, "TEXT_PREFIX").as_numpy().tolist()
             text_prefix = decoder_text_prompt[0][0].decode('utf-8')
-            if text_prefix == "":
-                text_prefix = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
-
-            prompt_id = self.tokenizer.encode(text_prefix, allowed_special=self.tokenizer.special_tokens_set)
-            decoder_input_ids = np.array([prompt_id], dtype=np.int32)
 
             wav = pb_utils.get_input_tensor_by_name(request, "WAV").as_numpy()
             assert wav.shape[0] == 1, "Only support batch size 1"
@@ -175,6 +233,35 @@ class TritonPythonModel:
 
             mel = self.feature_extractor.compute_feature(wav, target).transpose(1, 2)
             mel_len = np.array([[mel.shape[1]]], dtype=np.int32)
+
+            # Low-latency auto-language path.
+            # Do NOT call _detect_language() here, because that creates a
+            # separate TRT-LLM request and turns auto-language into a two-pass flow.
+            #
+            # Empty TEXT_PREFIX => single-pass auto:
+            #   <|startoftranscript|> -> model generates <|lang|>, task/control tokens, transcript
+            #
+            # If the caller sends a Whisper prefix that has task/control tokens but no
+            # language token, normalize it to SOT-only as well. This avoids the bad case:
+            #   <|startoftranscript|><|transcribe|><|notimestamps|>
+            # where language is absent but auto-detect is not triggered.
+            text_prefix = text_prefix.strip()
+            has_lang_tag = re.search(r"<\|[a-z]{2,3}\|>", text_prefix) is not None
+
+            if text_prefix == "":
+                text_prefix = "<|startoftranscript|>"
+            elif (
+                text_prefix.startswith("<|startoftranscript|>")
+                and text_prefix != "<|startoftranscript|>"
+                and not has_lang_tag
+            ):
+                text_prefix = "<|startoftranscript|>"
+
+            prompt_id = self.tokenizer.encode(
+                text_prefix,
+                allowed_special=self.tokenizer.special_tokens_set,
+            )
+            decoder_input_ids = np.array([prompt_id], dtype=np.int32)
 
             if self.decoupled:
                 response_sender = request.get_response_sender()
