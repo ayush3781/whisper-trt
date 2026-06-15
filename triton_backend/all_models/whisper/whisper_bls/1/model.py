@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import re
+import time
 import traceback
 
 import numpy as np
@@ -9,7 +10,7 @@ import triton_python_backend_utils as pb_utils
 from torch.utils.dlpack import to_dlpack
 
 from .fbank import FeatureExtractor
-from .tokenizer import get_tokenizer
+from .tokenizer import LANGUAGES, get_tokenizer
 
 
 class TritonPythonModel:
@@ -24,6 +25,12 @@ class TritonPythonModel:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.decoupled = pb_utils.using_decoupled_model_transaction_policy(self.model_config)
         self.logger = pb_utils.Logger
+        self.language_token_ids = None
+        self.sot_id = self.tokenizer.encode(
+            "<|startoftranscript|>",
+            allowed_special=self.tokenizer.special_tokens_set,
+        )[0]
+        self._get_language_token_ids()
         self.init_model(self.model_config['parameters'])
 
     def init_model(self, parameters):
@@ -33,7 +40,33 @@ class TritonPythonModel:
         self.zero_pad = True if parameters["zero_pad"] == "true" else False
         self.feature_extractor = FeatureExtractor(n_mels=n_mels)
 
-    def _prepare_inputs(self, request, mel_feature, mel_len, prompt, max_tokens=256):
+    def _get_language_token_ids(self):
+        if self.language_token_ids is None:
+            self.language_token_ids = {}
+            for lang in LANGUAGES:
+                token = f"<|{lang}|>"
+                try:
+                    token_id = self.tokenizer.encode(
+                        token,
+                        allowed_special=self.tokenizer.special_tokens_set,
+                    )[0]
+                except Exception:
+                    continue
+                self.language_token_ids[lang] = token_id
+        return self.language_token_ids
+
+    def _extract_language_candidates(self, text_prefix):
+        language_token_ids = self._get_language_token_ids()
+        candidates = []
+        seen = set()
+        for match in re.finditer(r"<\|([a-z]{2,3})\|>", text_prefix):
+            lang = match.group(1)
+            if lang in language_token_ids and lang not in seen:
+                candidates.append(lang)
+                seen.add(lang)
+        return candidates
+
+    def _prepare_inputs(self, request, mel_feature, mel_len, prompt, max_tokens=256, return_log_probs=True):
         input_dict = {
             "request_output_len": np.array([[max_tokens]], dtype=np.int32),
             "end_id": np.array([[self.eos]], dtype=np.int32),
@@ -42,7 +75,7 @@ class TritonPythonModel:
             "input_lengths": mel_len,
             "decoder_input_ids": prompt,
             "streaming": np.array([[self.decoupled]], dtype=np.bool_),
-            "return_log_probs": np.array([[True]], dtype=np.bool_),
+            "return_log_probs": np.array([[return_log_probs]], dtype=np.bool_),
         }
         input_tensor_list = [pb_utils.Tensor(k, v) for k, v in input_dict.items()]
         input_tensor_list.append(
@@ -50,34 +83,49 @@ class TritonPythonModel:
         )
         return input_tensor_list
 
-    def _detect_language(self, request, mel_feature, mel_len):
-        """Use Whisper's own decoder to predict the language token.
+    def _detect_language(self, request, mel_feature, mel_len, candidate_langs=None):
+        """Detect language from first-token logits.
 
-        This mirrors Whisper auto-detect at the BLS level:
-        1. Start decoding with only <|startoftranscript|>.
-        2. Ask the decoder for one token.
-        3. Treat that generated special token as the detected language.
+        If candidate_langs is provided, detection is constrained to that set.
+        Otherwise all Whisper language tokens supported by the tokenizer are
+        considered.
         """
-        sot_id = self.tokenizer.encode(
-            "<|startoftranscript|>",
-            allowed_special=self.tokenizer.special_tokens_set,
-        )[0]
+        language_token_ids = self._get_language_token_ids()
+        if candidate_langs:
+            candidates = [
+                lang for lang in candidate_langs
+                if lang in language_token_ids
+            ]
+        else:
+            candidates = list(language_token_ids.keys())
+        if not candidates:
+            candidates = list(language_token_ids.keys())
 
-        detect_prompt = np.array([[sot_id]], dtype=np.int32)
+        detect_prompt = np.array([[self.sot_id]], dtype=np.int32)
         detect_inputs = self._prepare_inputs(
             request,
             mel_feature,
             mel_len,
             detect_prompt,
             max_tokens=1,
+            return_log_probs=False,
+        )
+        detect_inputs.append(
+            pb_utils.Tensor("return_generation_logits", np.array([[True]], dtype=np.bool_))
         )
 
         detect_request = pb_utils.InferenceRequest(
             model_name="tensorrt_llm",
-            requested_output_names=["output_ids", "sequence_length", "output_log_probs"],
+            requested_output_names=[
+                "output_ids",
+                "sequence_length",
+                "generation_logits",
+            ],
             inputs=detect_inputs,
         )
+        detect_start = time.perf_counter()
         detect_response = detect_request.exec(decoupled=False)
+        detect_trt_ms = (time.perf_counter() - detect_start) * 1000.0
 
         if detect_response.has_error():
             raise pb_utils.TritonModelException(detect_response.error().message())
@@ -86,32 +134,52 @@ class TritonPythonModel:
             detect_response, "output_ids"
         ).as_numpy().flatten().tolist()
 
-        output_log_probs = pb_utils.get_output_tensor_by_name(
-            detect_response, "output_log_probs"
-        ).as_numpy().flatten().tolist()
+        generated_token_ids = output_token_ids_full[-1:] if output_token_ids_full else []
 
-        # The TRT-LLM output can include the prompt depending on config.
-        # output_log_probs corresponds only to generated tokens, so use it
-        # to slice out the generated part.
-        num_generated = len(output_log_probs)
-        generated_token_ids = (
-            output_token_ids_full[-num_generated:]
-            if num_generated > 0
-            else output_token_ids_full[-1:]
+        generated_lang = None
+        generated_token = ""
+        if generated_token_ids:
+            generated_token = self.tokenizer.decode([generated_token_ids[0]]).strip()
+            match = re.fullmatch(r"<\|([a-z]{2,3})\|>", generated_token)
+            if match and match.group(1) in candidates:
+                generated_lang = match.group(1)
+
+        generation_logits_tensor = pb_utils.get_output_tensor_by_name(
+            detect_response,
+            "generation_logits",
+        )
+        if generation_logits_tensor is None:
+            selected_lang = generated_lang or ("en" if "en" in candidates else candidates[0])
+            self.logger.log_info(
+                "language_detected "
+                f"method=generated_token selected={selected_lang} "
+                f"candidate_count={len(candidates)} detect_trt_ms={detect_trt_ms:.3f} "
+                f"generated_token={generated_token!r}",
+            )
+            return selected_lang
+
+        generation_logits = generation_logits_tensor.as_numpy()
+        first_token_logits = generation_logits.reshape(-1, generation_logits.shape[-1])[0]
+        scored_candidates = [
+            (lang, float(first_token_logits[language_token_ids[lang]]))
+            for lang in candidates
+        ]
+        scored_candidates.sort(key=lambda item: item[1], reverse=True)
+        selected_lang = scored_candidates[0][0]
+
+        top_candidates = ",".join(
+            f"{lang}:{score:.6f}"
+            for lang, score in scored_candidates[:5]
+        )
+        scope = "prompt_candidates" if candidate_langs else "all_languages"
+        self.logger.log_info(
+            "language_detected "
+            f"method=language_logits scope={scope} selected={selected_lang} "
+            f"candidate_count={len(candidates)} detect_trt_ms={detect_trt_ms:.3f} "
+            f"generated_token={generated_token!r} top_candidates={top_candidates!r}",
         )
 
-        if not generated_token_ids:
-            return "en"
-
-        detected_token = self.tokenizer.decode([generated_token_ids[0]]).strip()
-
-        # Expected output: <|en|>, <|es|>, <|ar|>, etc.
-        match = re.fullmatch(r"<\|([a-z]{2,3})\|>", detected_token)
-        if match:
-            return match.group(1)
-
-        # Safe fallback if the decoder emits a non-language token.
-        return "en"
+        return selected_lang
 
     def _prepare_llm_response(self, llm_request_inputs):
         llm_request = pb_utils.InferenceRequest(
@@ -234,28 +302,36 @@ class TritonPythonModel:
             mel = self.feature_extractor.compute_feature(wav, target).transpose(1, 2)
             mel_len = np.array([[mel.shape[1]]], dtype=np.int32)
 
-            # Low-latency auto-language path.
-            # Do NOT call _detect_language() here, because that creates a
-            # separate TRT-LLM request and turns auto-language into a two-pass flow.
-            #
-            # Empty TEXT_PREFIX => single-pass auto:
-            #   <|startoftranscript|> -> model generates <|lang|>, task/control tokens, transcript
-            #
-            # If the caller sends a Whisper prefix that has task/control tokens but no
-            # language token, normalize it to SOT-only as well. This avoids the bad case:
-            #   <|startoftranscript|><|transcribe|><|notimestamps|>
-            # where language is absent but auto-detect is not triggered.
             text_prefix = text_prefix.strip()
-            has_lang_tag = re.search(r"<\|[a-z]{2,3}\|>", text_prefix) is not None
+            language_candidates = self._extract_language_candidates(text_prefix)
 
             if text_prefix == "":
-                text_prefix = "<|startoftranscript|>"
+                detected_lang = self._detect_language(request, mel, mel_len)
+                text_prefix = (
+                    f"<|startoftranscript|><|{detected_lang}|>"
+                    "<|transcribe|><|notimestamps|>"
+                )
+            elif len(language_candidates) > 1:
+                detected_lang = self._detect_language(
+                    request,
+                    mel,
+                    mel_len,
+                    candidate_langs=language_candidates,
+                )
+                text_prefix = (
+                    f"<|startoftranscript|><|{detected_lang}|>"
+                    "<|transcribe|><|notimestamps|>"
+                )
             elif (
                 text_prefix.startswith("<|startoftranscript|>")
                 and text_prefix != "<|startoftranscript|>"
-                and not has_lang_tag
+                and not language_candidates
             ):
-                text_prefix = "<|startoftranscript|>"
+                detected_lang = self._detect_language(request, mel, mel_len)
+                text_prefix = (
+                    f"<|startoftranscript|><|{detected_lang}|>"
+                    "<|transcribe|><|notimestamps|>"
+                )
 
             prompt_id = self.tokenizer.encode(
                 text_prefix,
