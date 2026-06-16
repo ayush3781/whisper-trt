@@ -84,11 +84,12 @@ class TritonPythonModel:
         return input_tensor_list
 
     def _detect_language(self, request, mel_feature, mel_len, candidate_langs=None):
-        """Detect language from first-token logits.
+        """Detect language from next-token probabilities after SOT.
 
         If candidate_langs is provided, detection is constrained to that set.
         Otherwise all Whisper language tokens supported by the tokenizer are
-        considered.
+        considered. Uses context_logits because generation_logits is not
+        compatible with this TensorRT-LLM engine/config.
         """
         language_token_ids = self._get_language_token_ids()
         if candidate_langs:
@@ -111,7 +112,7 @@ class TritonPythonModel:
             return_log_probs=False,
         )
         detect_inputs.append(
-            pb_utils.Tensor("return_generation_logits", np.array([[True]], dtype=np.bool_))
+            pb_utils.Tensor("return_context_logits", np.array([[True]], dtype=np.bool_))
         )
 
         detect_request = pb_utils.InferenceRequest(
@@ -119,7 +120,7 @@ class TritonPythonModel:
             requested_output_names=[
                 "output_ids",
                 "sequence_length",
-                "generation_logits",
+                "context_logits",
             ],
             inputs=detect_inputs,
         )
@@ -133,7 +134,6 @@ class TritonPythonModel:
         output_token_ids_full = pb_utils.get_output_tensor_by_name(
             detect_response, "output_ids"
         ).as_numpy().flatten().tolist()
-
         generated_token_ids = output_token_ids_full[-1:] if output_token_ids_full else []
 
         generated_lang = None
@@ -144,11 +144,11 @@ class TritonPythonModel:
             if match and match.group(1) in candidates:
                 generated_lang = match.group(1)
 
-        generation_logits_tensor = pb_utils.get_output_tensor_by_name(
+        context_logits_tensor = pb_utils.get_output_tensor_by_name(
             detect_response,
-            "generation_logits",
+            "context_logits",
         )
-        if generation_logits_tensor is None:
+        if context_logits_tensor is None:
             selected_lang = generated_lang or ("en" if "en" in candidates else candidates[0])
             self.logger.log_info(
                 "language_detected "
@@ -158,10 +158,10 @@ class TritonPythonModel:
             )
             return selected_lang
 
-        generation_logits = generation_logits_tensor.as_numpy()
-        first_token_logits = generation_logits.reshape(-1, generation_logits.shape[-1])[0]
+        context_logits = context_logits_tensor.as_numpy()
+        next_token_logits = context_logits.reshape(-1, context_logits.shape[-1])[-1]
         scored_candidates = [
-            (lang, float(first_token_logits[language_token_ids[lang]]))
+            (lang, float(next_token_logits[language_token_ids[lang]]))
             for lang in candidates
         ]
         scored_candidates.sort(key=lambda item: item[1], reverse=True)
@@ -174,7 +174,7 @@ class TritonPythonModel:
         scope = "prompt_candidates" if candidate_langs else "all_languages"
         self.logger.log_info(
             "language_detected "
-            f"method=language_logits scope={scope} selected={selected_lang} "
+            f"method=context_logits scope={scope} selected={selected_lang} "
             f"candidate_count={len(candidates)} detect_trt_ms={detect_trt_ms:.3f} "
             f"generated_token={generated_token!r} top_candidates={top_candidates!r}",
         )
