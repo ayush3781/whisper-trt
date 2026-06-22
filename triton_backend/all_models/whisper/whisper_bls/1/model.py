@@ -66,6 +66,18 @@ class TritonPythonModel:
                 seen.add(lang)
         return candidates
 
+    def _extract_prompt_context(self, text_prefix):
+        return re.sub(r"^(?:\s*<\|[^|]+?\|>)*\s*", "", text_prefix).strip()
+
+    def _build_text_prefix(self, lang, prompt_context=""):
+        text_prefix = (
+            f"<|startoftranscript|><|{lang}|>"
+            "<|transcribe|><|notimestamps|>"
+        )
+        if prompt_context:
+            text_prefix = f"{text_prefix} {prompt_context.strip()}"
+        return text_prefix
+
     def _prepare_inputs(self, request, mel_feature, mel_len, prompt, max_tokens=256, return_log_probs=True):
         input_dict = {
             "request_output_len": np.array([[max_tokens]], dtype=np.int32),
@@ -304,13 +316,11 @@ class TritonPythonModel:
 
             text_prefix = text_prefix.strip()
             language_candidates = self._extract_language_candidates(text_prefix)
+            prompt_context = self._extract_prompt_context(text_prefix)
 
             if text_prefix == "":
                 detected_lang = self._detect_language(request, mel, mel_len)
-                text_prefix = (
-                    f"<|startoftranscript|><|{detected_lang}|>"
-                    "<|transcribe|><|notimestamps|>"
-                )
+                text_prefix = self._build_text_prefix(detected_lang)
             elif len(language_candidates) > 1:
                 detected_lang = self._detect_language(
                     request,
@@ -318,20 +328,14 @@ class TritonPythonModel:
                     mel_len,
                     candidate_langs=language_candidates,
                 )
-                text_prefix = (
-                    f"<|startoftranscript|><|{detected_lang}|>"
-                    "<|transcribe|><|notimestamps|>"
-                )
+                text_prefix = self._build_text_prefix(detected_lang, prompt_context)
             elif (
                 text_prefix.startswith("<|startoftranscript|>")
                 and text_prefix != "<|startoftranscript|>"
                 and not language_candidates
             ):
                 detected_lang = self._detect_language(request, mel, mel_len)
-                text_prefix = (
-                    f"<|startoftranscript|><|{detected_lang}|>"
-                    "<|transcribe|><|notimestamps|>"
-                )
+                text_prefix = self._build_text_prefix(detected_lang, prompt_context)
 
             prompt_id = self.tokenizer.encode(
                 text_prefix,
