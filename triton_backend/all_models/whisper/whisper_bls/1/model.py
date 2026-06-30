@@ -14,24 +14,27 @@ from .tokenizer import LANGUAGES, get_tokenizer
 
 
 class TritonPythonModel:
-    """Your Python model must use the same class name. Every Python model
-    that is created must have "TritonPythonModel" as the class name.
-    """
+    """Triton Python backend model."""
+
     def initialize(self, args):
-        self.model_config = json.loads(args['model_config'])
+        self.model_config = json.loads(args["model_config"])
 
         self.tokenizer = get_tokenizer(num_languages=100)
-        self.eos = self.tokenizer.encode("<|endoftext|>", allowed_special=self.tokenizer.special_tokens_set)[0]
+        self.eos = self.tokenizer.encode(
+            "<|endoftext|>",
+            allowed_special=self.tokenizer.special_tokens_set,
+        )[0]
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.decoupled = pb_utils.using_decoupled_model_transaction_policy(self.model_config)
         self.logger = pb_utils.Logger
+        self.request_count = 0
         self.language_token_ids = None
         self.sot_id = self.tokenizer.encode(
             "<|startoftranscript|>",
             allowed_special=self.tokenizer.special_tokens_set,
         )[0]
         self._get_language_token_ids()
-        self.init_model(self.model_config['parameters'])
+        self.init_model(self.model_config["parameters"])
 
     def init_model(self, parameters):
         for key, value in parameters.items():
@@ -95,14 +98,8 @@ class TritonPythonModel:
         )
         return input_tensor_list
 
-    def _detect_language(self, request, mel_feature, mel_len, candidate_langs=None):
-        """Detect language from next-token probabilities after SOT.
-
-        If candidate_langs is provided, detection is constrained to that set.
-        Otherwise all Whisper language tokens supported by the tokenizer are
-        considered. Uses context_logits because generation_logits is not
-        compatible with this TensorRT-LLM engine/config.
-        """
+    def _detect_language(self, request, mel_feature, mel_len, candidate_langs=None, request_id=None):
+        """Detect language from next-token probabilities after SOT."""
         language_token_ids = self._get_language_token_ids()
         if candidate_langs:
             candidates = [
@@ -138,7 +135,7 @@ class TritonPythonModel:
         )
         detect_start = time.perf_counter()
         detect_response = detect_request.exec(decoupled=False)
-        detect_trt_ms = (time.perf_counter() - detect_start) * 1000.0
+        detect_ms = (time.perf_counter() - detect_start) * 1000.0
 
         if detect_response.has_error():
             raise pb_utils.TritonModelException(detect_response.error().message())
@@ -163,10 +160,8 @@ class TritonPythonModel:
         if context_logits_tensor is None:
             selected_lang = generated_lang or ("en" if "en" in candidates else candidates[0])
             self.logger.log_info(
-                "language_detected "
-                f"method=generated_token selected={selected_lang} "
-                f"candidate_count={len(candidates)} detect_trt_ms={detect_trt_ms:.3f} "
-                f"generated_token={generated_token!r}",
+                f"whisper_timing request_id={request_id} "
+                f"language={selected_lang} lang_detect_ms={detect_ms:.3f}"
             )
             return selected_lang
 
@@ -179,21 +174,14 @@ class TritonPythonModel:
         scored_candidates.sort(key=lambda item: item[1], reverse=True)
         selected_lang = scored_candidates[0][0]
 
-        top_candidates = ",".join(
-            f"{lang}:{score:.6f}"
-            for lang, score in scored_candidates[:5]
-        )
-        scope = "prompt_candidates" if candidate_langs else "all_languages"
         self.logger.log_info(
-            "language_detected "
-            f"method=context_logits scope={scope} selected={selected_lang} "
-            f"candidate_count={len(candidates)} detect_trt_ms={detect_trt_ms:.3f} "
-            f"generated_token={generated_token!r} top_candidates={top_candidates!r}",
+            f"whisper_timing request_id={request_id} "
+            f"language={selected_lang} lang_detect_ms={detect_ms:.3f}"
         )
 
         return selected_lang
 
-    def _prepare_llm_response(self, llm_request_inputs):
+    def _prepare_llm_response(self, llm_request_inputs, request_id, transcript_start):
         llm_request = pb_utils.InferenceRequest(
             model_name="tensorrt_llm",
             requested_output_names=["output_ids", "sequence_length", "output_log_probs", "cum_log_probs"],
@@ -214,20 +202,22 @@ class TritonPythonModel:
             cum_log_probs = pb_utils.get_output_tensor_by_name(
                 llm_response, "cum_log_probs").as_numpy().flatten()
 
-            # Keep only generated tokens (exclude prompt)
             num_generated = len(output_log_probs_full)
             output_token_ids = output_token_ids_full[-num_generated:] if num_generated > 0 else []
 
-            # Decode generated text
             output_text = self.tokenizer.decode(output_token_ids).strip()
-            output_text = re.sub(r'<\|.*?\|>', '', output_text)
+            output_text = re.sub(r"<\|.*?\|>", "", output_text)
 
-            # Convert to tensors
+            transcript_ms = (time.perf_counter() - transcript_start) * 1000.0
+            self.logger.log_info(
+                f"whisper_timing request_id={request_id} "
+                f"transcript_gen_ms={transcript_ms:.3f} transcript={output_text!r}"
+            )
+
             output_token_ids_array = np.array(output_token_ids, dtype=np.int32)
             output_log_probs_array = np.array(output_log_probs_full, dtype=np.float32)
             cum_log_probs_array = np.array(cum_log_probs, dtype=np.float32)
 
-            # Build response
             output_tensors = [
                 pb_utils.Tensor("TRANSCRIPTS", np.array([output_text], dtype=np.object_)),
                 pb_utils.Tensor("OUTPUT_TOKEN_IDS", output_token_ids_array),
@@ -267,15 +257,18 @@ class TritonPythonModel:
                 except Exception:
                     pass
 
-                # Keep only generated tokens (exclude prompt)
                 num_generated = len(output_log_probs_full)
                 output_token_ids = output_token_ids_full[-num_generated:] if num_generated > 0 else []
 
-                # Decode generated text
                 output_text = self.tokenizer.decode(output_token_ids).strip()
-                output_text = re.sub(r'<\|.*?\|>', '', output_text)
+                output_text = re.sub(r"<\|.*?\|>", "", output_text)
 
-                # Convert to tensors
+                transcript_ms = (time.perf_counter() - transcript_start) * 1000.0
+                self.logger.log_info(
+                    f"whisper_timing request_id={request_id} "
+                    f"transcript_gen_ms={transcript_ms:.3f} transcript={output_text!r}"
+                )
+
                 output_token_ids_array = np.array(output_token_ids, dtype=np.int32)
                 output_log_probs_array = np.array(output_log_probs_full, dtype=np.float32)
 
@@ -297,8 +290,12 @@ class TritonPythonModel:
     def execute(self, requests):
         responses = []
         for request in requests:
+            self.request_count += 1
+            request_id = self.request_count
+            request_start = time.perf_counter()
+
             decoder_text_prompt = pb_utils.get_input_tensor_by_name(request, "TEXT_PREFIX").as_numpy().tolist()
-            text_prefix = decoder_text_prompt[0][0].decode('utf-8')
+            text_prefix = decoder_text_prompt[0][0].decode("utf-8")
 
             wav = pb_utils.get_input_tensor_by_name(request, "WAV").as_numpy()
             assert wav.shape[0] == 1, "Only support batch size 1"
@@ -319,7 +316,12 @@ class TritonPythonModel:
             prompt_context = self._extract_prompt_context(text_prefix)
 
             if text_prefix == "":
-                detected_lang = self._detect_language(request, mel, mel_len)
+                detected_lang = self._detect_language(
+                    request,
+                    mel,
+                    mel_len,
+                    request_id=request_id,
+                )
                 text_prefix = self._build_text_prefix(detected_lang)
             elif len(language_candidates) > 1:
                 detected_lang = self._detect_language(
@@ -327,6 +329,7 @@ class TritonPythonModel:
                     mel,
                     mel_len,
                     candidate_langs=language_candidates,
+                    request_id=request_id,
                 )
                 text_prefix = self._build_text_prefix(detected_lang, prompt_context)
             elif (
@@ -334,7 +337,12 @@ class TritonPythonModel:
                 and text_prefix != "<|startoftranscript|>"
                 and not language_candidates
             ):
-                detected_lang = self._detect_language(request, mel, mel_len)
+                detected_lang = self._detect_language(
+                    request,
+                    mel,
+                    mel_len,
+                    request_id=request_id,
+                )
                 text_prefix = self._build_text_prefix(detected_lang, prompt_context)
 
             prompt_id = self.tokenizer.encode(
@@ -355,13 +363,23 @@ class TritonPythonModel:
                     else:
                         responses.append(error)
 
-                llm_responses = self._prepare_llm_response(llm_request_inputs)
+                transcript_start = time.perf_counter()
+                llm_responses = self._prepare_llm_response(
+                    llm_request_inputs,
+                    request_id,
+                    transcript_start,
+                )
 
                 for triton_response in llm_responses:
                     if self.decoupled:
                         response_sender.send(triton_response)
                     else:
                         responses.append(triton_response)
+
+                total_ms = (time.perf_counter() - request_start) * 1000.0
+                self.logger.log_info(
+                    f"whisper_timing request_id={request_id} total_ms={total_ms:.3f}"
+                )
 
                 if self.decoupled:
                     response_sender.send(flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
