@@ -9,6 +9,7 @@ import torch
 import triton_python_backend_utils as pb_utils
 from torch.utils.dlpack import to_dlpack
 
+from .apm import capture_apm_exception, init_apm
 from .fbank import FeatureExtractor
 from .tokenizer import LANGUAGES, get_tokenizer
 
@@ -28,6 +29,8 @@ class TritonPythonModel:
         self.decoupled = pb_utils.using_decoupled_model_transaction_policy(self.model_config)
         self.logger = pb_utils.Logger
         self.request_count = 0
+        self._failed_requests = 0
+        self._apm_client = init_apm()
         self.language_token_ids = None
         self.sot_id = self.tokenizer.encode(
             "<|startoftranscript|>",
@@ -288,6 +291,41 @@ class TritonPythonModel:
                 yield response
 
     def execute(self, requests):
+        """Trace one Triton dynamic batch as one Elastic APM transaction."""
+        apm_client = getattr(self, "_apm_client", None)
+        if apm_client is None:
+            return self._execute(requests)
+
+        try:
+            apm_client.begin_transaction("inference")
+        except Exception as exc:
+            self.logger.log_warn(
+                f"Elastic APM transaction start failed: {exc}"
+            )
+            return self._execute(requests)
+
+        failed_before = self._failed_requests
+        raised = False
+        try:
+            return self._execute(requests)
+        except BaseException:
+            raised = True
+            capture_apm_exception(apm_client)
+            raise
+        finally:
+            result = (
+                "failure"
+                if raised or self._failed_requests > failed_before
+                else "success"
+            )
+            try:
+                apm_client.end_transaction("whisper_bls.execute", result)
+            except Exception as exc:
+                self.logger.log_warn(
+                    f"Elastic APM transaction end failed: {exc}"
+                )
+
+    def _execute(self, requests):
         responses = []
         for request in requests:
             self.request_count += 1
@@ -385,6 +423,8 @@ class TritonPythonModel:
                     response_sender.send(flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
 
             except Exception:
+                self._failed_requests += 1
+                capture_apm_exception(getattr(self, "_apm_client", None))
                 self.logger.log_error(traceback.format_exc())
                 error_response = pb_utils.InferenceResponse(
                     output_tensors=[], error=pb_utils.TritonError(traceback.format_exc())
@@ -400,3 +440,11 @@ class TritonPythonModel:
         else:
             assert len(responses) == len(requests)
             return responses
+
+    def finalize(self):
+        apm_client = getattr(self, "_apm_client", None)
+        if apm_client is not None:
+            try:
+                apm_client.close()
+            except Exception as exc:
+                self.logger.log_warn(f"Elastic APM shutdown failed: {exc}")
